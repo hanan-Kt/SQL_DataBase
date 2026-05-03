@@ -1,3 +1,3 @@
 # SQL_DataBase
-Creating a large student databse and applying SQL quieries for testing.
-Still in testing!
+Learning how to create and manage databses and applying SQL quieries for testing.
+Still testing!
