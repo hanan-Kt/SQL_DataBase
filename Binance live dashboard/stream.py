@@ -7,7 +7,7 @@ from flask import Flask
 
 app = Flask(__name__)
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://neondb_owner:npg_3t5hyXVfivjr@ep-damp-mud-b5db2bd4-pooler.c-7.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require")
 
 def insert_live_data():
     while True:
