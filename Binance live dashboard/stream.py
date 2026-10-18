@@ -1,52 +1,43 @@
-import asyncio
-import json
 import os
+import time
+import random
+import threading
 import psycopg2
-import websockets
+from flask import Flask
 
-# Read the database URL from an environment variable
-DB_URL = os.environ.get("DATABASE_URL", "postgresql://neondb_owner:npg_3uIFkZBgVb8v@ep-small-recipe-b53xutlw-pooler.c-7.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require")
+app = Flask(__name__)
 
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-def init_db():
-  conn = psycopg2.connect(DB_URL)
-  cursor = conn.cursor()
-  cursor.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id SERIAL PRIMARY KEY,
-            timestamp BIGINT,
-            symbol VARCHAR(20),
-            price DOUBLE PRECISION
-        );
-    """)
-  conn.commit()
-  cursor.close()
-  conn.close()
-
-
-async def listen_and_store():
-  init_db()
-  conn = psycopg2.connect(DB_URL)
-  cursor = conn.cursor()
-
-  uri = "wss://stream.binance.com:9443/ws/btcusdt@trade"
-
-  async with websockets.connect(uri) as websocket:
-    print("Connected to Binance! Streaming to Neon Postgres...")
+def insert_live_data():
     while True:
-      raw_data = await websocket.recv()
-      data = json.loads(raw_data)
+        try:
+            conn = psycopg2.connect(DATABASE_URL)
+            cur = conn.cursor()
+            current_time = int(time.time())
+            dummy_price = random.randint(40000, 90000)
 
-      symbol = data.get("s")
-      price = float(data.get("p"))
-      timestamp = data.get("T")
+            cur.execute(
+                "INSERT INTO trades (timestamp, price) VALUES (%s, %s)",
+                (current_time, dummy_price)
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+            print(f"Inserted: {current_time}, {dummy_price}")
+        except Exception as e:
+            print("Database insertion error:", e)
 
-      cursor.execute(
-          "INSERT INTO trades (timestamp, symbol, price) VALUES (%s, %s, %s)",
-          (timestamp, symbol, price),
-      )
-      conn.commit()
+        time.sleep(5)  # Pause between inserts
 
+# Start the background thread
+thread = threading.Thread(target=insert_live_data, daemon=True)
+thread.start()
+
+@app.route("/")
+def home():
+    return "Live Data Streamer is Running!"
 
 if __name__ == "__main__":
-  asyncio.run(listen_and_store())
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
