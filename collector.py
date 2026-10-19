@@ -1,14 +1,19 @@
 """
 BTCUSDT collector: Binance -> Neon Postgres (for Grafana).
 
-- On start (and after every reconnect) it back-fills any missing 1-minute candles.
-- Then it streams the live 1-minute candle and UPSERTS it (one row per minute, no duplicates).
+Two tables:
+  candles     : 1-minute candles, live (recent history, BACKFILL_DAYS)
+  candles_1h  : 1-hour candles, full history from HISTORY_START (default 2021-01-01)
+
+- On start (and after every reconnect) it back-fills any missing candles.
+- It streams the live 1-minute candle and UPSERTS it (no duplicates).
+- A background task keeps the hourly table up to date.
 - Reconnects automatically if Binance or the database drops the connection.
 - If a PORT env var exists (Render web service), it serves a tiny "ok" page for UptimeRobot.
 
 Required env var:  DATABASE_URL
-Optional env vars: SYMBOL (BTCUSDT), BACKFILL_DAYS (30), WRITE_EVERY_SECONDS (2),
-                   BINANCE_REST, BINANCE_WS
+Optional env vars: SYMBOL (BTCUSDT), BACKFILL_DAYS (30), HISTORY_START (2021-01-01),
+                   WRITE_EVERY_SECONDS (2), BINANCE_REST, BINANCE_WS
 """
 import asyncio
 import json
@@ -25,6 +30,9 @@ import websockets
 DB_URL = os.environ["DATABASE_URL"]
 SYMBOL = os.environ.get("SYMBOL", "BTCUSDT").upper()
 BACKFILL_DAYS = int(os.environ.get("BACKFILL_DAYS", "30"))
+HISTORY_START = datetime.fromisoformat(os.environ.get("HISTORY_START", "2021-01-01")).replace(
+    tzinfo=timezone.utc
+)
 WRITE_EVERY = float(os.environ.get("WRITE_EVERY_SECONDS", "2"))
 # Market-data-only endpoints; they work in regions where api.binance.com is blocked.
 REST_BASE = os.environ.get("BINANCE_REST", "https://data-api.binance.vision")
@@ -33,6 +41,9 @@ PORT = os.environ.get("PORT")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("collector")
+
+# interval -> (table, candle length in ms)
+INTERVALS = {"1m": ("candles", 60_000), "1h": ("candles_1h", 3_600_000)}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS candles (
@@ -45,10 +56,20 @@ CREATE TABLE IF NOT EXISTS candles (
     volume DOUBLE PRECISION,
     PRIMARY KEY (symbol, ts)
 );
+CREATE TABLE IF NOT EXISTS candles_1h (
+    symbol TEXT             NOT NULL,
+    ts     TIMESTAMPTZ      NOT NULL,
+    open   DOUBLE PRECISION,
+    high   DOUBLE PRECISION,
+    low    DOUBLE PRECISION,
+    close  DOUBLE PRECISION,
+    volume DOUBLE PRECISION,
+    PRIMARY KEY (symbol, ts)
+);
 """
 
 UPSERT = """
-INSERT INTO candles (symbol, ts, open, high, low, close, volume)
+INSERT INTO {table} (symbol, ts, open, high, low, close, volume)
 VALUES %s
 ON CONFLICT (symbol, ts) DO UPDATE SET
     high   = EXCLUDED.high,
@@ -100,30 +121,33 @@ class DB:
                 time.sleep(2 * (attempt + 1))
         raise RuntimeError(f"Database unreachable: {last_err}")
 
-    def upsert(self, rows):
+    def upsert(self, rows, table="candles"):
         def fn(conn):
             with conn.cursor() as cur:
-                psycopg2.extras.execute_values(cur, UPSERT, rows, page_size=1000)
+                psycopg2.extras.execute_values(
+                    cur, UPSERT.format(table=table), rows, page_size=1000
+                )
         self.run(fn)
 
-    def last_ts(self):
+    def last_ts(self, table="candles"):
         def fn(conn):
             with conn.cursor() as cur:
-                cur.execute("SELECT MAX(ts) FROM candles WHERE symbol = %s;", (SYMBOL,))
+                cur.execute(f"SELECT MAX(ts) FROM {table} WHERE symbol = %s;", (SYMBOL,))
                 return cur.fetchone()[0]
         return self.run(fn)
 
 
-def backfill(db):
-    """Fill every missing 1m candle from the last stored one (or BACKFILL_DAYS ago) until now."""
-    last = db.last_ts()
-    start = last if last else datetime.now(timezone.utc) - timedelta(days=BACKFILL_DAYS)
+def backfill(db, interval, default_start):
+    """Fill every missing candle from the last stored one (or default_start) until now."""
+    table, step_ms = INTERVALS[interval]
+    last = db.last_ts(table)
+    start = last if last else default_start
     start_ms = int(start.timestamp() * 1000)
     total = 0
     while True:
         r = requests.get(
             f"{REST_BASE}/api/v3/klines",
-            params={"symbol": SYMBOL, "interval": "1m", "startTime": start_ms, "limit": 1000},
+            params={"symbol": SYMBOL, "interval": interval, "startTime": start_ms, "limit": 1000},
             timeout=20,
         )
         r.raise_for_status()
@@ -134,17 +158,30 @@ def backfill(db):
             (SYMBOL, to_dt(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5]))
             for k in klines
         ]
-        db.upsert(rows)
+        db.upsert(rows, table)
         total += len(rows)
-        start_ms = klines[-1][0] + 60_000
+        start_ms = klines[-1][0] + step_ms
         if len(klines) < 1000:
             break
         time.sleep(0.2)
-    log.info("Backfill done: %d candles written/refreshed.", total)
+    if total > 1:
+        log.info("Backfill %s done: %d candles written/refreshed.", interval, total)
+
+
+async def hourly_loop():
+    """Keeps the hourly table (full history) filled and current. Uses its own DB connection."""
+    db = DB()
+    while True:
+        try:
+            await asyncio.to_thread(backfill, db, "1h", HISTORY_START)
+        except Exception as e:
+            log.warning("Hourly update failed: %s", e)
+        await asyncio.sleep(60)
 
 
 async def stream(db):
-    await asyncio.to_thread(backfill, db)
+    default_1m = datetime.now(timezone.utc) - timedelta(days=BACKFILL_DAYS)
+    await asyncio.to_thread(backfill, db, "1m", default_1m)
     url = f"{WS_BASE}/ws/{SYMBOL.lower()}@kline_1m"
     log.info("Connecting to %s", url)
     async with websockets.connect(url, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
@@ -159,7 +196,7 @@ async def stream(db):
                     SYMBOL, to_dt(k["t"]),
                     float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"]),
                 )
-                await asyncio.to_thread(db.upsert, [row])
+                await asyncio.to_thread(db.upsert, [row], "candles")
                 last_write = now
 
 
@@ -176,6 +213,7 @@ async def main():
     if PORT:
         await asyncio.start_server(health, "0.0.0.0", int(PORT))
         log.info("Health server listening on port %s", PORT)
+    asyncio.create_task(hourly_loop())
     db = DB()
     delay = 1
     while True:
