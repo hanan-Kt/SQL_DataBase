@@ -30,9 +30,7 @@ import websockets
 DB_URL = os.environ["DATABASE_URL"]
 SYMBOL = os.environ.get("SYMBOL", "BTCUSDT").upper()
 BACKFILL_DAYS = int(os.environ.get("BACKFILL_DAYS", "30"))
-HISTORY_START = datetime.fromisoformat(os.environ.get("HISTORY_START", "2021-01-01")).replace(
-    tzinfo=timezone.utc
-)
+HISTORY_START = datetime.fromisoformat(os.environ.get("HISTORY_START", "2021-01-01")).replace(tzinfo=timezone.utc)
 WRITE_EVERY = float(os.environ.get("WRITE_EVERY_SECONDS", "2"))
 # Market-data-only endpoints; they work in regions where api.binance.com is blocked.
 REST_BASE = os.environ.get("BINANCE_REST", "https://data-api.binance.vision")
