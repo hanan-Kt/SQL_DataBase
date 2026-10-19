@@ -1,15 +1,22 @@
 """
-BTCUSDT collector: Binance -> Neon Postgres (for Grafana).
+BTCUSDT collector: Binance -> Neon Postgres (for Grafana).  v3 (self-healing)
 
-Two tables:
-  candles     : 1-minute candles, live (recent history, BACKFILL_DAYS)
+Tables / views
+  candles     : 1-minute candles, live (last BACKFILL_DAYS days, grows forever)
   candles_1h  : 1-hour candles, full history from HISTORY_START (default 2021-01-01)
+  btc_price   : VIEW = hourly candles for old history + 1-minute candles for recent time
+                (this is the one Grafana should query)
 
-- On start (and after every reconnect) it back-fills any missing candles.
-- It streams the live 1-minute candle and UPSERTS it (no duplicates).
-- A background task keeps the hourly table up to date.
-- Reconnects automatically if Binance or the database drops the connection.
-- If a PORT env var exists (Render web service), it serves a tiny "ok" page for UptimeRobot.
+What it does
+  * Creates tables/view once at startup (no race between connections).
+  * Back-fills missing candles at start-up and after every reconnect:
+      - continues from the last stored candle
+      - fills any missing history BEFORE the first stored candle (e.g. after raising BACKFILL_DAYS)
+      - repairs holes in the middle if more than 2% of candles are missing
+  * Streams the live 1-minute candle and UPSERTS it (no duplicates possible).
+  * Keeps the hourly table current in a background task.
+  * Retries on Binance rate limits / network errors and reconnects the DB and websocket.
+  * Opens the Render URL in a browser and you see a live status page with row counts.
 
 Required env var:  DATABASE_URL
 Optional env vars: SYMBOL (BTCUSDT), BACKFILL_DAYS (30), HISTORY_START (2021-01-01),
@@ -27,10 +34,17 @@ import psycopg2.extras
 import requests
 import websockets
 
+
+def parse_start(s):
+    s = s.strip().replace("Z", "")
+    dt = datetime.fromisoformat(s)
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 DB_URL = os.environ["DATABASE_URL"]
 SYMBOL = os.environ.get("SYMBOL", "BTCUSDT").upper()
 BACKFILL_DAYS = int(os.environ.get("BACKFILL_DAYS", "30"))
-HISTORY_START = datetime.fromisoformat(os.environ.get("HISTORY_START", "2021-01-01")).replace(tzinfo=timezone.utc)
+HISTORY_START = parse_start(os.environ.get("HISTORY_START", "2021-01-01"))
 WRITE_EVERY = float(os.environ.get("WRITE_EVERY_SECONDS", "2"))
 # Market-data-only endpoints; they work in regions where api.binance.com is blocked.
 REST_BASE = os.environ.get("BINANCE_REST", "https://data-api.binance.vision")
@@ -64,6 +78,12 @@ CREATE TABLE IF NOT EXISTS candles_1h (
     volume DOUBLE PRECISION,
     PRIMARY KEY (symbol, ts)
 );
+CREATE OR REPLACE VIEW btc_price AS
+    SELECT symbol, ts, close
+    FROM candles_1h
+    WHERE ts < COALESCE((SELECT MIN(ts) FROM candles), 'infinity'::timestamptz)
+    UNION ALL
+    SELECT symbol, ts, close FROM candles;
 """
 
 UPSERT = """
@@ -76,22 +96,24 @@ ON CONFLICT (symbol, ts) DO UPDATE SET
     volume = EXCLUDED.volume;
 """
 
+STATUS = {"text": "starting..."}
+
 
 def to_dt(ms):
     return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc)
 
 
 def init_schema():
-    """Create the tables once at startup, before any other DB connection exists."""
+    """Create tables/view once at startup, before any other DB connection exists."""
     last_err = None
-    for _ in range(5):
+    for _ in range(6):
         try:
             conn = psycopg2.connect(DB_URL, connect_timeout=15)
             conn.autocommit = True
             with conn.cursor() as cur:
                 cur.execute(SCHEMA)
             conn.close()
-            log.info("Database tables ready.")
+            log.info("Database tables and view ready.")
             return
         except Exception as e:
             last_err = e
@@ -144,29 +166,51 @@ class DB:
                 )
         self.run(fn)
 
-    def last_ts(self, table="candles"):
+    def bounds(self, table):
+        """Returns (first_ts, last_ts, row_count) for the symbol."""
         def fn(conn):
             with conn.cursor() as cur:
-                cur.execute(f"SELECT MAX(ts) FROM {table} WHERE symbol = %s;", (SYMBOL,))
-                return cur.fetchone()[0]
+                cur.execute(
+                    f"SELECT MIN(ts), MAX(ts), COUNT(*) FROM {table} WHERE symbol = %s;",
+                    (SYMBOL,),
+                )
+                return cur.fetchone()
         return self.run(fn)
 
 
-def backfill(db, interval, default_start):
-    """Fill every missing candle from the last stored one (or default_start) until now."""
+def fetch_klines(interval, start_ms, end_ms=None):
+    params = {"symbol": SYMBOL, "interval": interval, "startTime": start_ms, "limit": 1000}
+    if end_ms:
+        params["endTime"] = end_ms
+    for attempt in range(8):
+        try:
+            r = requests.get(f"{REST_BASE}/api/v3/klines", params=params, timeout=20)
+            if r.status_code in (418, 429):
+                wait = min(int(r.headers.get("Retry-After", 10)), 120)
+                log.warning("Binance rate limit (HTTP %s), waiting %ss", r.status_code, wait)
+                time.sleep(wait)
+                continue
+            if r.status_code in (403, 451):
+                raise RuntimeError(
+                    f"Binance blocks this server's region (HTTP {r.status_code}). "
+                    "Change the Render region (Frankfurt/Singapore) or set BINANCE_REST."
+                )
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            log.warning("Binance request failed (%s), retry %d/8", e, attempt + 1)
+            time.sleep(min(2 * (attempt + 1), 30))
+    raise RuntimeError("Binance requests kept failing")
+
+
+def backfill_range(db, interval, start, end=None):
+    """Download candles from start (to end, if given) and upsert them. Safe to repeat."""
     table, step_ms = INTERVALS[interval]
-    last = db.last_ts(table)
-    start = last if last else default_start
     start_ms = int(start.timestamp() * 1000)
+    end_ms = int(end.timestamp() * 1000) if end else None
     total = 0
     while True:
-        r = requests.get(
-            f"{REST_BASE}/api/v3/klines",
-            params={"symbol": SYMBOL, "interval": interval, "startTime": start_ms, "limit": 1000},
-            timeout=20,
-        )
-        r.raise_for_status()
-        klines = r.json()
+        klines = fetch_klines(interval, start_ms, end_ms)
         if not klines:
             break
         rows = [
@@ -176,27 +220,69 @@ def backfill(db, interval, default_start):
         db.upsert(rows, table)
         total += len(rows)
         start_ms = klines[-1][0] + step_ms
-        if len(klines) < 1000:
+        if len(klines) < 1000 or (end_ms and start_ms > end_ms):
             break
         time.sleep(0.2)
+    return total
+
+
+def sync(db, interval, history_start, deep=False):
+    """Bring the table up to date. deep=True also repairs old history and holes."""
+    table, step_ms = INTERVALS[interval]
+    first, last, count = db.bounds(table)
+    total = 0
+    if first is None:
+        total += backfill_range(db, interval, history_start)
+    else:
+        if deep:
+            # 1) history missing before the first stored candle
+            if first - history_start > timedelta(milliseconds=step_ms * 3):
+                log.info("%s: filling history before %s", table, first)
+                total += backfill_range(db, interval, history_start, first)
+            # 2) holes in the middle
+            expected = int((last - first).total_seconds() * 1000 // step_ms) + 1
+            if count < expected * 0.98:
+                log.info("%s: %d of ~%d candles present, repairing holes", table, count, expected)
+                total += backfill_range(db, interval, first, last)
+        # 3) everything after the last stored candle (re-fetches the last one, refreshing it)
+        total += backfill_range(db, interval, last)
     if total > 1:
-        log.info("Backfill %s done: %d candles written/refreshed.", interval, total)
+        log.info("Sync %s done: %d candles written/refreshed.", interval, total)
+    return total
 
 
 async def hourly_loop():
     """Keeps the hourly table (full history) filled and current. Uses its own DB connection."""
     db = DB()
+    deep = True
     while True:
         try:
-            await asyncio.to_thread(backfill, db, "1h", HISTORY_START)
+            await asyncio.to_thread(sync, db, "1h", HISTORY_START, deep)
+            deep = False
         except Exception as e:
             log.warning("Hourly update failed: %s", e)
         await asyncio.sleep(60)
 
 
+async def status_loop():
+    """Builds the status text shown on the web page and printed to the logs."""
+    db = DB()
+    while True:
+        try:
+            lines = []
+            for name, (table, _) in INTERVALS.items():
+                first, last, n = await asyncio.to_thread(db.bounds, table)
+                lines.append(f"{table}: rows={n} first={first} last={last}")
+            STATUS["text"] = f"updated {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC\n" + "\n".join(lines)
+            log.info("STATUS | " + " | ".join(lines))
+        except Exception as e:
+            STATUS["text"] = f"status error: {e}"
+        await asyncio.sleep(300)
+
+
 async def stream(db):
-    default_1m = datetime.now(timezone.utc) - timedelta(days=BACKFILL_DAYS)
-    await asyncio.to_thread(backfill, db, "1m", default_1m)
+    start_1m = datetime.now(timezone.utc) - timedelta(days=BACKFILL_DAYS)
+    await asyncio.to_thread(sync, db, "1m", start_1m, True)
     url = f"{WS_BASE}/ws/{SYMBOL.lower()}@kline_1m"
     log.info("Connecting to %s", url)
     async with websockets.connect(url, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
@@ -218,7 +304,11 @@ async def stream(db):
 async def health(reader, writer):
     try:
         await reader.read(1024)
-        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok")
+        body = (STATUS["text"] + "\nok").encode()
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: "
+            + str(len(body)).encode() + b"\r\n\r\n" + body
+        )
         await writer.drain()
     finally:
         writer.close()
@@ -227,9 +317,9 @@ async def health(reader, writer):
 async def main():
     if PORT:
         await asyncio.start_server(health, "0.0.0.0", int(PORT))
-        log.info("Health server listening on port %s", PORT)
+        log.info("Health/status server listening on port %s", PORT)
     await asyncio.to_thread(init_schema)
-    asyncio.create_task(hourly_loop())
+    tasks = [asyncio.create_task(hourly_loop()), asyncio.create_task(status_loop())]  # keep refs
     db = DB()
     delay = 1
     while True:
