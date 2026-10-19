@@ -22,7 +22,7 @@ import psycopg2.extras
 import requests
 import websockets
 
-DB_URL = os.environ["postgresql://neondb_owner:npg_dl5AV1NacGgQ@ep-snowy-cloud-b5zwqm0a-pooler.c-7.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"]
+DB_URL = os.environ["DATABASE_URL"]
 SYMBOL = os.environ.get("SYMBOL", "BTCUSDT").upper()
 BACKFILL_DAYS = int(os.environ.get("BACKFILL_DAYS", "30"))
 WRITE_EVERY = float(os.environ.get("WRITE_EVERY_SECONDS", "2"))
