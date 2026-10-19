@@ -83,6 +83,25 @@ def to_dt(ms):
     return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc)
 
 
+def init_schema():
+    """Create the tables once at startup, before any other DB connection exists."""
+    last_err = None
+    for _ in range(5):
+        try:
+            conn = psycopg2.connect(DB_URL, connect_timeout=15)
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(SCHEMA)
+            conn.close()
+            log.info("Database tables ready.")
+            return
+        except Exception as e:
+            last_err = e
+            log.warning("Schema init failed (%s), retrying...", e)
+            time.sleep(3)
+    raise RuntimeError(f"Could not initialise database: {last_err}")
+
+
 class DB:
     """Lazy connection that reconnects itself."""
 
@@ -99,8 +118,6 @@ class DB:
             keepalives_count=5,
         )
         self.conn.autocommit = True
-        with self.conn.cursor() as cur:
-            cur.execute(SCHEMA)
 
     def run(self, fn):
         last_err = None
@@ -213,6 +230,7 @@ async def main():
     if PORT:
         await asyncio.start_server(health, "0.0.0.0", int(PORT))
         log.info("Health server listening on port %s", PORT)
+    await asyncio.to_thread(init_schema)
     asyncio.create_task(hourly_loop())
     db = DB()
     delay = 1
